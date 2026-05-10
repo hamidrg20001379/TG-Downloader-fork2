@@ -162,7 +162,8 @@ jobs:
                           print(f"⚠️ Warning: Failed to fetch channel page ({response.status_code}).")
                           break
                       # Extract message links using regex
-                      message_links = re.findall(r'https://t\.me/[a-zA-Z0-9_]+/\d+', response.text)
+                      message_links = re.findall(r'href="(/[^"]+/[0-9]+)"', response.text)
+                      message_links = ["https://t.me" + x for x in message_links]
                       for link in message_links:
                           collected_links.add(link)
                       if len(collected_links) >= scan_limit:
