@@ -1,0 +1,570 @@
+name: 📲 Telegram Downloader (yt-dlp حرفه‌ای)
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_links:
+        description: '🔗 پیوندهای تلگرام (جدا با کاما، فاصله یا خط جدید)'
+        required: true
+        type: string
+      password:
+        description: '🔐 رمز فشرده‌سازی (اختیاری)'
+        required: false
+        default: ''
+        type: string
+      file_format:
+        description: '📂 نوع فایل‌های مورد نظر'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'zip'
+          - 'mp3'
+          - 'mp4'
+          - 'rar'
+          - 'mkv'
+          - 'pdf'
+          - 'archive (zip/rar/7z)'
+          - 'audio (mp3/wav/flac)'
+          - 'video (mp4/mkv/avi)'
+          - 'document (pdf/docx/txt)'
+
+jobs:
+  download-telegram:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📂 Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: ⚙️ Git setup
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git config --global http.postBuffer 524288000
+
+      - name: 🔧 Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq python3 python3-pip aria2 p7zip-full unzip
+          pip3 install requests cloudscraper yt-dlp --quiet
+          echo "✅ Ready"
+
+      - name: 📁 Create downloads folder
+        run: mkdir -p downloads
+
+      # ========================== RESOLVE & DOWNLOAD ==========================
+      - name: 🔍 Resolve & Download (yt-dlp اول)
+        id: download
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys, re, hashlib, glob, shutil, urllib.parse, tempfile, time
+
+          raw_links = """${{ github.event.inputs.telegram_links }}"""
+          format_choice = """${{ github.event.inputs.file_format }}""".strip().lower()
+
+          wanted = {
+              'all': set(),
+              'zip': {'zip'}, 'mp3': {'mp3'}, 'mp4': {'mp4'}, 'rar': {'rar'},
+              'mkv': {'mkv'}, 'pdf': {'pdf'},
+              'archive (zip/rar/7z)': {'zip','rar','7z','gz','bz2','xz','tar'},
+              'audio (mp3/wav/flac)': {'mp3','wav','flac','m4a','aac','ogg'},
+              'video (mp4/mkv/avi)': {'mp4','mkv','avi','mov','wmv','flv'},
+              'document (pdf/docx/txt)': {'pdf','docx','doc','txt','rtf','xlsx','pptx'}
+          }.get(format_choice, set())
+
+          links = re.split(r'[,\s\n]+', raw_links)
+          links = [l.strip() for l in links if l.strip().startswith('http')]
+          seen = set()
+          unique = [l for l in links if not (l in seen or seen.add(l))]
+
+          if not unique:
+              print("❌ No links")
+              sys.exit(1)
+
+          print(f"📋 {len(unique)} links  📂 Filter: {wanted or 'all'}")
+
+          # ---------- Helpers ----------
+          def sanitize(name, max_len=80):
+              base, ext = os.path.splitext(name)
+              if not all(ord(c) < 128 for c in base):
+                  base = hashlib.md5(name.encode()).hexdigest()[:12]
+              else:
+                  base = re.sub(r'[^a-zA-Z0-9._-]', '_', base).strip('_.-')
+                  if not base: base = hashlib.md5(name.encode()).hexdigest()[:12]
+              if len(base) > max_len: base = base[:max_len]
+              return f"{base}{ext.lower()}" if ext else base
+
+          def unique_folder(parent, name, max_name_len=50):
+              if len(name) > max_name_len: name = name[:max_name_len]
+              p = os.path.join(parent, name)
+              if not os.path.exists(p): return name
+              i = 1
+              while os.path.exists(os.path.join(parent, f"{name}_copy{i}")):
+                  i += 1
+                  if len(f"{name}_copy{i}") > max_name_len:
+                      name = hashlib.md5((name+str(i)).encode()).hexdigest()[:12]
+                      break
+              return f"{name}_copy{i}" if 'name' not in locals() else name
+
+          def download_url(url, outpath):
+              """Download a URL to file, retrying with different tools"""
+              headers = [
+                  '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                  '-H', 'Accept: */*',
+                  '-H', 'Accept-Encoding: identity',
+                  '-H', 'Referer: https://t.me/',
+                  '-H', 'DNT: 1',
+              ]
+              for tool, cmd in [
+                  ('curl', ['curl', '-L', '--max-time', '7200', '--connect-timeout', '60',
+                           '--retry', '5', '--retry-delay', '10', '-o', outpath] + headers + [url]),
+                  ('wget', ['wget', '--timeout=600', '--tries=5', '--continue',
+                           '--no-check-certificate',
+                           '--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                           '--header=Referer: https://t.me/', '-O', outpath, url]),
+                  ('aria2c', ['aria2c', '--max-tries=5', '--retry-wait=10', '--timeout=600',
+                             '--allow-overwrite=true', '--check-certificate=false',
+                             '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                             '--dir='+os.path.dirname(outpath), '--out='+os.path.basename(outpath), url])
+              ]:
+                  if os.path.exists(outpath): os.remove(outpath)
+                  try:
+                      subprocess.run(cmd, capture_output=True, timeout=7200)
+                      if os.path.exists(outpath) and os.path.getsize(outpath) > 1024:
+                          for a in glob.glob(outpath+'.aria2'): os.remove(a)
+                          return True
+                  except:
+                      pass
+              return False
+
+          def is_likely_thumbnail(url):
+              """Check if a URL is likely a thumbnail (image) vs actual file"""
+              path = urllib.parse.urlparse(url).path.lower()
+              if re.search(r'\.(jpg|jpeg|png|gif|webp|svg|ico)(\?|$)', path):
+                  return True
+              return False
+
+          def is_likely_actual_file(url, content_type_hint=None):
+              """Check if URL likely points to an actual downloadable file"""
+              path = urllib.parse.urlparse(url).path.lower()
+              # File extensions we want
+              good_exts = ['.zip', '.rar', '.mp3', '.mp4', '.mkv', '.pdf', '.7z', '.gz', '.tar',
+                          '.bz2', '.xz', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt',
+                          '.m4a', '.aac', '.ogg', '.flac', '.wav', '.mov', '.avi', '.wmv', '.flv',
+                          '.exe', '.apk', '.iso', '.bin', '.dmg', '.deb', '.rpm']
+              if any(path.endswith(e) for e in good_exts):
+                  return True
+              if content_type_hint:
+                  if any(ct in content_type_hint for ct in ['application/', 'audio/', 'video/', 'binary']):
+                      if 'image/' not in content_type_hint:
+                          return True
+              return False
+
+          def get_url_content_info(url):
+              """Do a HEAD request to get content-type and content-length"""
+              try:
+                  import requests
+                  resp = requests.head(url, timeout=15, allow_redirects=True,
+                                      headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                                              'Referer': 'https://t.me/'})
+                  ct = resp.headers.get('Content-Type', '')
+                  cl = resp.headers.get('Content-Length', '0')
+                  return ct, int(cl) if cl.isdigit() else 0
+              except:
+                  return '', 0
+
+          # --------------------------------------
+
+          downloaded = []
+          failed = []
+          os.makedirs('downloads', exist_ok=True)
+
+          for idx, link in enumerate(unique, 1):
+              print(f"\n{'='*60}")
+              print(f"🔍 [{idx}/{len(unique)}] {link[:70]}...")
+              resolved_urls = []  # can be multiple candidates
+              filename = None
+
+              # ===== METHOD 1: yt-dlp (best for Telegram) =====
+              try:
+                  print("  Method 1: yt-dlp")
+                  import yt_dlp
+                  class URLCollector:
+                      def __init__(self):
+                          self.urls = []
+                          self.info = None
+                      def hook(self, d):
+                          pass
+
+                  collector = URLCollector()
+                  ydl_opts = {
+                      'quiet': True,
+                      'no_warnings': True,
+                      'simulate': True,
+                      'dump_single_json': True,
+                      'no_color': True,
+                      'extract_flat': False,
+                      'force_generic_extractor': False,
+                      # These help with Telegram
+                      'socket_timeout': 30,
+                      'retries': 5,
+                      'fragment_retries': 5,
+                      'skip_unavailable_fragments': False,
+                      'extractor_args': {'telegram': {'skip_thumbnail': ['1']}},
+                  }
+                  try:
+                      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                          info = ydl.extract_info(link, download=False)
+                          if info:
+                              collector.info = info
+                              # Collect all possible URLs
+                              if info.get('url'):
+                                  resolved_urls.append(('yt-dlp', info['url']))
+                              if info.get('formats'):
+                                  for fmt in info['formats']:
+                                      if fmt.get('url'):
+                                          resolved_urls.append(('yt-dlp', fmt['url']))
+                              if info.get('entries'):
+                                  for entry in info['entries']:
+                                      if entry.get('url'):
+                                          resolved_urls.append(('yt-dlp', entry['url']))
+                                      if entry.get('formats'):
+                                          for fmt in entry['formats']:
+                                              if fmt.get('url'):
+                                                  resolved_urls.append(('yt-dlp', fmt['url']))
+                              if not resolved_urls:
+                                  # Try --get-url as subprocess (sometimes works better)
+                                  res = subprocess.run(
+                                      ['yt-dlp', '--get-url', '--no-warnings', '--force-ipv4',
+                                       '--extractor-args', 'telegram:skip_thumbnail=1', link],
+                                      capture_output=True, text=True, timeout=30
+                                  )
+                                  if res.returncode == 0 and res.stdout.strip():
+                                      for u in res.stdout.strip().split('\n'):
+                                          u = u.strip()
+                                          if u and u.startswith('http'):
+                                              resolved_urls.append(('yt-dlp-subproc', u))
+                          else:
+                              # yt-dlp failed, try subprocess
+                              res = subprocess.run(
+                                  ['yt-dlp', '--get-url', '--no-warnings', '--force-ipv4',
+                                   '--extractor-args', 'telegram:skip_thumbnail=1', link],
+                                  capture_output=True, text=True, timeout=30
+                              )
+                              if res.returncode == 0 and res.stdout.strip():
+                                  for u in res.stdout.strip().split('\n'):
+                                      u = u.strip()
+                                      if u and u.startswith('http'):
+                                          resolved_urls.append(('yt-dlp-subproc', u))
+                  except Exception as e:
+                      # Fallback to subprocess
+                      res = subprocess.run(
+                          ['yt-dlp', '--get-url', '--no-warnings', '--force-ipv4',
+                           '--extractor-args', 'telegram:skip_thumbnail=1', link],
+                          capture_output=True, text=True, timeout=30
+                      )
+                      if res.returncode == 0 and res.stdout.strip():
+                          for u in res.stdout.strip().split('\n'):
+                              u = u.strip()
+                              if u and u.startswith('http'):
+                                  resolved_urls.append(('yt-dlp-subproc', u))
+
+                  if resolved_urls:
+                      # Remove duplicates
+                      seen_urls = set()
+                      unique_urls = []
+                      for src, u in resolved_urls:
+                          if u not in seen_urls:
+                              seen_urls.add(u)
+                              unique_urls.append((src, u))
+                      resolved_urls = unique_urls
+                      print(f"    ✅ yt-dlp: {len(resolved_urls)} URL(s) found")
+                      # Try to get filename from info
+                      if collector.info and collector.info.get('title'):
+                          filename = sanitize(collector.info['title'], 50)
+                  else:
+                      print(f"    ⚠️ yt-dlp: no URLs found")
+              except Exception as e:
+                  print(f"    ⚠️ yt-dlp error: {e}")
+
+              # ===== METHOD 2: cloudscraper scrape (smart) =====
+              if not resolved_urls:
+                  try:
+                      print("  Method 2: cloudscraper (smart scrape)")
+                      import cloudscraper
+                      scraper = cloudscraper.create_scraper(
+                          browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True, 'mobile': False}
+                      )
+                      resp = scraper.get(link, timeout=30, allow_redirects=True)
+                      if resp.status_code == 200 and resp.text:
+                          page = resp.text
+                          if idx == 1:
+                              with open('/tmp/telegram_page.html', 'w', encoding='utf-8') as f:
+                                  f.write(page)
+                              print("      📄 page saved for debug")
+
+                          all_cdn_links = set(re.findall(r'https://cdn\d*\.telesco\.pe/file/[^"\'>\s]+', page))
+                          # Also find download link
+                          dl = re.search(
+                              r'<a\s[^>]*class=["\'][^"\']*tgme_widget_message_download_link[^"\']*["\'][^>]*href=["\']([^"\']+)["\']',
+                              page, re.IGNORECASE
+                          )
+                          if dl:
+                              href = dl.group(1).strip()
+                              if href.startswith('/'): href = 'https://t.me' + href
+                              try:
+                                  resp2 = scraper.get(href, timeout=30, allow_redirects=True, stream=True)
+                                  all_cdn_links.add(resp2.url)
+                                  print(f"    Found download link → {resp2.url[:70]}")
+                              except:
+                                  pass
+                          # Also check meta
+                          for prop in ['og:video', 'og:video:url', 'og:audio', 'og:image']:
+                              m = re.search(f'<meta[^>]+property=["\']{prop}["\'][^>]+content=["\']([^"\']+)["\']', page, re.IGNORECASE)
+                              if m:
+                                  all_cdn_links.add(m.group(1).strip())
+
+                          # Now classify URLs
+                          for cdn in all_cdn_links:
+                              # Skip if too short or obviously broken
+                              if len(cdn) < 20: continue
+                              resolved_urls.append(('scrape', cdn))
+                              print(f"    Found CDN: {cdn[:70]}")
+
+                          if resolved_urls:
+                              # Remove duplicates
+                              seen_urls = set()
+                              unique_urls = []
+                              for src, u in resolved_urls:
+                                  if u not in seen_urls:
+                                      seen_urls.add(u)
+                                      unique_urls.append((src, u))
+                              resolved_urls = unique_urls
+                      else:
+                          print(f"      HTTP {resp.status_code}")
+                  except Exception as e:
+                      print(f"    ⚠️ Method 2 error: {e}")
+
+              # ===== Now find the BEST URL among candidates =====
+              if not resolved_urls:
+                  print("  ❌ Could not resolve any URL")
+                  failed.append({'original_name': link, 'telegram_link': link, 'status': 'failed'})
+                  continue
+
+              # Prioritize: skip thumbnails, prefer actual files
+              # Check content-type and size for each candidate
+              candidates_info = []
+              for src, url in resolved_urls:
+                  ct, cl = '', 0
+                  if is_likely_actual_file(url):
+                      # Check quickly
+                      try:
+                          ct, cl = get_url_content_info(url)
+                      except:
+                          pass
+                  candidates_info.append((src, url, ct, cl))
+
+              # Score: non-thumbnail + large size = best
+              def score(candidate):
+                  src, url, ct, cl = candidate
+                  pts = 0
+                  if not is_likely_thumbnail(url): pts += 10
+                  if is_likely_actual_file(url, ct): pts += 20
+                  if cl > 1024*1024: pts += 5  # > 1MB
+                  if cl > 100*1024*1024: pts += 10  # > 100MB
+                  # Prefer yt-dlp sourced
+                  if src == 'yt-dlp' or src == 'yt-dlp-subproc': pts += 15
+                  return pts
+
+              candidates_info.sort(key=score, reverse=True)
+              best = candidates_info[0]
+              src, resolved_url, ct, cl = best
+              print(f"    🏆 Best URL (score={score(best)}): {resolved_url[:70]}")
+
+              # Determine filename
+              if not filename:
+                  # Try to get from Content-Disposition or URL
+                  if 'Content-Disposition' in ct:
+                      disp = ct.split('filename=')[-1].strip('"\' ')
+                      if disp:
+                          filename = disp
+              if not filename:
+                  filename = resolved_url.split('/')[-1].split('?')[0]
+                  if not filename:
+                      filename = f"telegram_file_{idx}"
+
+              # Extract extension and check filter
+              fname_clean = filename.split('?')[0].split('#')[0]
+              ext = os.path.splitext(fname_clean)[1].lower().lstrip('.')
+              if not ext:
+                  # Guess from content-type
+                  if 'application/zip' in ct: ext = 'zip'
+                  elif 'application/x-rar' in ct: ext = 'rar'
+                  elif 'video/' in ct: ext = 'mp4'
+                  elif 'audio/' in ct: ext = 'mp3'
+                  elif 'application/pdf' in ct: ext = 'pdf'
+                  elif cl > 1024*1024 and not is_likely_thumbnail(resolved_url):
+                      ext = 'bin'
+                  else:
+                      ext = 'jpg'  # likely thumbnail
+
+              # Check filter
+              if wanted and ext not in wanted:
+                  print(f"  ⏭️ Skipped (ext: {ext})")
+                  continue
+
+              # Sanitize and create folder
+              safe = sanitize(fname_clean if '.' in fname_clean else f"{fname_clean}.{ext}", max_len=50)
+              base, _ = os.path.splitext(safe)
+              folder_base = base[:40] if len(base) > 40 else base
+              folder = unique_folder('downloads', folder_base, max_name_len=40)
+              fpath = os.path.join('downloads', folder)
+              os.makedirs(fpath, exist_ok=True)
+              out = os.path.join(fpath, safe)
+
+              print(f"  📄 {safe}")
+              print(f"  📁 {folder}")
+              print(f"  ⬇️ Downloading... (size: {cl/(1024*1024) if cl > 0 else 'unknown'} MB)")
+
+              if download_url(resolved_url, out):
+                  sz = os.path.getsize(out)/(1024*1024)
+                  print(f"  ✅ {sz:.2f} MB")
+                  downloaded.append({
+                      'filename': safe, 'folder_name': folder,
+                      'original_name': filename[:50], 'telegram_link': link,
+                      'size_mb': round(sz,2), 'status': 'success'
+                  })
+              else:
+                  print(f"  ❌ Download failed")
+                  failed.append({'original_name': filename[:50], 'folder_name': folder,
+                                 'telegram_link': link, 'status': 'failed'})
+
+          # Cleanup
+          for a in glob.glob('downloads/**/*.aria2', recursive=True):
+              os.remove(a)
+
+          with open('/tmp/downloaded_files.json', 'w') as f:
+              json.dump(downloaded, f)
+          with open('/tmp/failed_downloads.json', 'w') as f:
+              json.dump(failed, f)
+
+          print(f"\n✅ Downloaded: {len(downloaded)}  ❌ Failed: {len(failed)}")
+          if not downloaded:
+              sys.exit(1)
+          PYEOF
+
+      # ========================== PACKAGE ==========================
+      - name: 📦 Package (ZIP & split)
+        id: package
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess, json, glob
+          MAX_MB = 90
+          PWD = """${{ github.event.inputs.password }}"""
+          with open('/tmp/downloaded_files.json') as f:
+              files = json.load(f)
+          if not files:
+              exit(0)
+          packaged = []
+          for fi in files:
+              fn = fi['filename']
+              folder = fi['folder_name']
+              fpath = os.path.join('downloads', folder, fn)
+              if not os.path.exists(fpath): continue
+              size_mb = os.path.getsize(fpath)/(1024*1024)
+              entry = {**fi, 'size_mb':round(size_mb,2), 'status':'success', 'parts':[]}
+              base = os.path.splitext(fn)[0]
+              archive = f"{base}.zip"
+              owd = os.getcwd()
+              os.chdir(os.path.join('downloads', folder))
+              if size_mb > MAX_MB:
+                  cmd = ['7z','a','-tzip','-mx=1', f'-v{MAX_MB}m', archive, fn]
+                  if PWD: cmd.insert(3, f'-p{PWD}')
+              else:
+                  cmd = ['7z','a','-tzip','-mx=1', archive, fn]
+                  if PWD: cmd.insert(3, f'-p{PWD}')
+              res = subprocess.run(cmd, capture_output=True, text=True)
+              os.chdir(owd)
+              if res.returncode == 0:
+                  os.remove(fpath)
+                  parts = sorted(glob.glob(os.path.join('downloads', folder, f"{base}.z[0-9][0-9]")))
+                  main_zip = os.path.join('downloads', folder, archive)
+                  if os.path.exists(main_zip): parts.append(main_zip)
+                  for p in parts:
+                      sz = os.path.getsize(p)/(1024*1024)
+                      entry['parts'].append({'name':os.path.basename(p), 'size_mb':round(sz,2)})
+                  print(f"  ✅ {len(entry['parts'])} part(s)")
+              else:
+                  print(f"  ⚠️ 7z error")
+                  entry['parts'].append({'name':fn, 'size_mb':round(size_mb,2)})
+              packaged.append(entry)
+          with open('/tmp/packaged_files.json','w') as f:
+              json.dump(packaged, f)
+          PYEOF
+
+      # ========================== README & LINKS ==========================
+      - name: 📝 Generate README and Links.md
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from urllib.parse import quote
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['GITHUB_REF_NAME']
+          with open('/tmp/packaged_files.json') as f:
+              files = json.load(f)
+          lines = ["# 📥 دانلود شده‌ها\n---\n"]
+          ok = [f for f in files if f['status']=='success']
+          fail = [f for f in files if f['status']!='success']
+          if ok:
+              lines.append("## ✅ موفق\n| # | فایل | حجم | پوشه |\n|---|------|------|------|\n")
+              for i,f in enumerate(ok,1):
+                  lnk = f"./{quote(f['folder_name'])}"
+                  lines.append(f"| {i} | {f['original_name']} | {f['size_mb']} MB | [📁]({lnk}) |\n")
+          if fail:
+              lines.append("\n## ❌ ناموفق\n")
+              for f in fail:
+                  lines.append(f"- {f['original_name']} ([منبع]({f['telegram_link']}))\n")
+          with open('downloads/README.md','w') as f:
+              f.write(''.join(lines))
+          link_lines = ["# لینک‌های دانلود\n---\n"]
+          for i, fi in enumerate(ok,1):
+              raw = f"https://github.com/{repo}/raw/refs/heads/{branch}/downloads/{quote(fi['folder_name'])}"
+              link_lines.append(f"## {i}. {fi['original_name']}\nحجم: {fi['size_mb']} MB\n\n")
+              for p in fi['parts']:
+                  u = f"{raw}/{quote(p['name'])}"
+                  link_lines.append(f"- [{p['name']}]({u}) ({p['size_mb']} MB)\n")
+              link_lines.append("---\n")
+          with open('Links.md','w') as f:
+              f.write(''.join(link_lines))
+          print("✅ README & Links.md created")
+          PYEOF
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: 📤 Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git fetch origin "$BRANCH"
+          git pull --rebase origin "$BRANCH" || git pull origin "$BRANCH" --no-rebase
+          git add downloads/ Links.md
+          if ! git diff --staged --quiet; then
+            git commit -m "📲 update [skip ci]"
+            git push origin "HEAD:$BRANCH"
+            echo "✅ Pushed"
+          else
+            echo "ℹ️ No changes"
+          fi
+
+      - name: 📋 Final Report
+        if: always()
+        run: |
+          echo "✅ Done. Check downloads/ folder."
